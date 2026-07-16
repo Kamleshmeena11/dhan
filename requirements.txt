@@ -1,4 +1,4 @@
-fyers-apiv3
+dhanhq
 requests
 pyotp
 google-auth
