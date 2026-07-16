@@ -133,15 +133,38 @@ def on_message(instance, message):
 async def feed_receive_loop(feed):
     """Owns the actual receive loop. feed.connect() alone only opens the socket
     and subscribes - it never reads messages. get_instrument_data() must be
-    awaited repeatedly to pull data off the wire."""
+    awaited repeatedly to pull data off the wire.
+
+    Reconnects use exponential backoff and explicitly disconnect() first -
+    Dhan allows only a handful of concurrent WS connections per client and
+    will rate-limit (HTTP 429) or hard-kill the connection if you hammer it
+    with rapid reconnect attempts without releasing the previous one.
+    """
+    backoff = 3
+    max_backoff = 60
     await feed.connect()
     while True:
         try:
             data = await feed.get_instrument_data()
             on_message(feed, data)
+            backoff = 3  # reset after any successful read
         except Exception as e:
-            logger.error(f"Feed receive error: {e}. Reconnecting in 3s...")
-            await asyncio.sleep(3)
+            code = getattr(e, "code", None)
+            reason = getattr(e, "reason", None)
+            logger.error(f"Feed receive error: {e} (code={code}, reason={reason!r}).")
+
+            try:
+                await feed.disconnect()
+            except Exception:
+                pass  # already dead, nothing to clean up
+
+            if "429" in str(e):
+                backoff = max(backoff, 30)  # respect Dhan's rate limit explicitly
+
+            logger.error(f"Reconnecting in {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
             try:
                 await feed.connect()
             except Exception as reconnect_err:
