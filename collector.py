@@ -45,6 +45,12 @@ CSV_FILENAME = "candles_1s_all.csv"
 # --- Google Drive Sync Helper ---
 def upload_to_drive():
     """Uploads/Updates the CSV file on Google Drive."""
+    # 1. Prevent crash by checking if the CSV exists first
+    if not os.path.exists(CSV_FILENAME):
+        logger.info(f"Local file {CSV_FILENAME} does not exist yet. Skipping sync...")
+        return
+
+    # 2. Check credentials
     if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
         logger.warning("Google Drive credentials missing. Skipping cloud backup.")
         return
