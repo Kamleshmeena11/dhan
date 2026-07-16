@@ -30,11 +30,10 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
-# Target Instruments (Nifty 50 Index & Nifty Futures)
-# For v2.2.0, use MarketFeed subscription codes
+# Target Instruments: Nifty 50 Index Spot Only (No Futures)
+# Exchange Segment 2 is for NSE Indices. Security ID "13" is Nifty 50 Index.
 INSTRUMENTS = [
-    (MarketFeed.NSE, "13", MarketFeed.Ticker),        # Nifty 50 Index
-    (MarketFeed.NSE_FNO, "35078", MarketFeed.Ticker)  # Near month Future
+    (2, "13", MarketFeed.Ticker)  # (Segment 2 = NSE Indices, ID "13", Subscription Type)
 ]
 
 # State variables to hold tick data
@@ -45,12 +44,10 @@ CSV_FILENAME = "candles_1s_all.csv"
 # --- Google Drive Sync Helper ---
 def upload_to_drive():
     """Uploads/Updates the CSV file on Google Drive."""
-    # 1. Prevent crash by checking if the CSV exists first
     if not os.path.exists(CSV_FILENAME):
         logger.info(f"Local file {CSV_FILENAME} does not exist yet. Skipping sync...")
         return
 
-    # 2. Check credentials
     if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
         logger.warning("Google Drive credentials missing. Skipping cloud backup.")
         return
