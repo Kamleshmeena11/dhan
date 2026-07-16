@@ -1,6 +1,6 @@
 import json, os, sys, time, datetime, threading, queue, requests
 from dhanhq import dhanhq
-from dhanhq import marketfeed
+from dhanhq import DhanFeed
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -215,7 +215,7 @@ async def on_message(instance, message):
 # Dhan Websocket Core Runner Thread
 def run_dhan_websocket():
     # subscription_code 2 corresponds to marketfeed.Ticker (LTP + volume)
-    feed = marketfeed.DhanFeed(
+    feed = DhanFeed(
         client_id=DHAN_CLIENT_ID,
         access_token=DHAN_ACCESS_TOKEN,
         instruments=INSTRUMENTS,
