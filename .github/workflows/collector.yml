@@ -1,0 +1,41 @@
+name: 📈 Nifty 1s Bar Collector
+on:
+  workflow_dispatch:
+
+jobs:
+  collect:
+    name: Collect Market Data
+    runs-on: ubuntu-latest
+    timeout-minutes: 375
+    steps:
+      - name: ⬇️ Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: 🚀 Run collector
+        env:
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: python collector.py
+
+      - name: 📁 Upload daily + combined CSVs as artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nifty-bars-${{ github.run_id }}
+          path: |
+            daily_bars/*.csv
+            candles_1s_all.csv
+          retention-days: 30
