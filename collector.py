@@ -34,7 +34,7 @@ GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 # For v2.2.0, use MarketFeed subscription codes
 INSTRUMENTS = [
     (MarketFeed.NSE, "13", MarketFeed.Ticker),        # Nifty 50 Index
-    (MarketFeed.NSE_FNO, "35078", MarketFeed.Ticker)  # Near month Future (Adjust ID if expired)
+    (MarketFeed.NSE_FNO, "35078", MarketFeed.Ticker)  # Near month Future
 ]
 
 # State variables to hold tick data
@@ -118,12 +118,12 @@ def process_ticks_to_1s():
         logger.info(f"Saved {len(new_rows)} rows for timestamp {timestamp_str}")
 
 
-# --- Dhan Feed Callback Handlers ---
-async def on_connect(instance):
+# --- Dhan Feed Callback Handlers (Synchronous for v2.2.0) ---
+def on_connect(instance):
     logger.info("Successfully connected to Dhan Market Feed WebSockets.")
 
 
-async def on_message(instance, message):
+def on_message(instance, message):
     """Processes incoming ticker stream messages."""
     try:
         # Check if the message contains valid ticker/LTP fields
@@ -176,7 +176,7 @@ async def main():
         version="v2"
     )
 
-    # 2. Assign callbacks
+    # 2. Assign synchronous callbacks
     feed.on_connect = on_connect
     feed.on_message = on_message
 
