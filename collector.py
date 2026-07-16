@@ -30,7 +30,7 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
 INSTRUMENTS = [
-    (2, "13", MarketFeed.Ticker)  # Segment 2 = NSE Indices, ID "13" = Nifty 50 Index
+    (MarketFeed.IDX, "13", MarketFeed.Ticker)  # IDX (0) = NSE Indices segment ("IDX_I"), ID "13" = Nifty 50 Index
 ]
 
 tick_store = {}
