@@ -1,14 +1,16 @@
 import os
 import sys
 import time
-import json
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 
-# Dhan v2.2.0 imports
-from dhanhq import DhanContext, MarketFeed
+# Upstox SDK Imports
+import upstox_client
+from upstox_client.rest import ApiException
+
+# Google Drive Imports
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
@@ -22,19 +24,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration & Credentials ---
-CLIENT_ID = os.environ.get("DHAN_CLIENT_ID")
-ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN")
+UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
-INSTRUMENTS = [
-    (MarketFeed.IDX, "13", MarketFeed.Ticker)  # IDX (0) = NSE Indices segment ("IDX_I"), ID "13" = Nifty 50 Index
-]
-
-tick_store = {}
-CSV_FILENAME = "candles_1s_all.csv"
+# Instrument Key for Nifty 50 Index (Upstox format)
+INSTRUMENT_KEY = "NSE_INDEX|Nifty 50" 
+INTERVAL = "1minute" # Upstox API native options: 1minute, 30minute, day, etc.
+CSV_FILENAME = "candles_upstox.csv"
 
 
 def upload_to_drive():
@@ -70,113 +69,63 @@ def upload_to_drive():
         logger.error(f"Error syncing to Google Drive: {e}")
 
 
-def process_ticks_to_1s():
-    now = datetime.now()
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-    new_rows = []
-    for inst_id, ticks in list(tick_store.items()):
-        if not ticks:
-            continue
-        prices = [t["price"] for t in ticks]
-        volumes = [t.get("volume", 0) for t in ticks]
-
-        new_rows.append({
-            "timestamp": timestamp_str,
-            "instrument_id": inst_id,
-            "open": prices[0],
-            "high": max(prices),
-            "low": min(prices),
-            "close": prices[-1],
-            "volume": sum(volumes)
-        })
-        tick_store[inst_id] = []
-
-    if new_rows:
-        df = pd.DataFrame(new_rows)
-        file_exists = os.path.isfile(CSV_FILENAME)
-        df.to_csv(CSV_FILENAME, mode="a", index=False, header=not file_exists)
-        logger.info(f"Saved {len(new_rows)} rows for timestamp {timestamp_str}")
-
-
-def on_connect(instance):
-    logger.info("Successfully connected to Dhan Market Feed WebSockets.")
-
-
-def on_message(instance, message):
-    """Processes a single parsed tick dict returned by MarketFeed.get_instrument_data().
-
-    Ticker-mode packets look like:
-        {"type": "Ticker Data", "exchange_segment": ..., "security_id": ...,
-         "LTP": "24123.45", "LTT": ...}
-    Note: key is "LTP" (a string), not "last_traded_price"/"price", and there is
-    no "volume" field in Ticker mode (only in Quote/Full mode).
+async def fetch_upstox_candles_loop(api_instance):
     """
-    try:
-        if not message or message.get("type") != "Ticker Data":
-            return
-
-        inst_id = message.get("security_id")
-        ltp = message.get("LTP")
-        if inst_id is None or ltp is None:
-            return
-
-        inst_id = str(inst_id)
-        tick_store.setdefault(inst_id, []).append({
-            "price": float(ltp),
-            "volume": 0.0  # not available in Ticker mode
-        })
-    except Exception as e:
-        logger.error(f"Error handling live feed message: {e}")
-
-
-async def feed_receive_loop(feed):
-    """Owns the actual receive loop. feed.connect() alone only opens the socket
-    and subscribes - it never reads messages. get_instrument_data() must be
-    awaited repeatedly to pull data off the wire.
-
-    Reconnects use exponential backoff and explicitly disconnect() first -
-    Dhan allows only a handful of concurrent WS connections per client and
-    will rate-limit (HTTP 429) or hard-kill the connection if you hammer it
-    with rapid reconnect attempts without releasing the previous one.
+    Polls the Upstox Historical/Intraday API every second to fetch completed 
+    or live candle data, directly bypassing manual tick aggregation.
     """
-    backoff = 3
-    max_backoff = 60
-    await feed.connect()
+    logger.info("Starting Upstox data collection loop...")
+    last_processed_timestamp = None
+
     while True:
         try:
-            data = await feed.get_instrument_data()
-            on_message(feed, data)
-            backoff = 3  # reset after any successful read
+            # Align loop to fire exactly on the 1-second boundary
+            now = time.time()
+            sleep_time = 1.0 - (now % 1.0)
+            await asyncio.sleep(sleep_time)
+
+            # Define historical data window (fetching today's candles)
+            to_date = datetime.now().strftime("%Y-%m-%d")
+            
+            # API Call to fetch intraday candles
+            api_response = api_instance.get_intra_day_candle_data(
+                instrument_key=INSTRUMENT_KEY,
+                interval=INTERVAL,
+                to_date=to_date,
+                api_version="2.0"
+            )
+
+            if api_response and api_response.data and api_response.data.candles:
+                # Upstox returns candles in descending order (latest first)
+                # Structure: [timestamp, open, high, low, close, volume, open_interest]
+                latest_candle = api_response.data.candles[0]
+                candle_timestamp = latest_candle[0]
+
+                # Prevent writing duplicate rows for the same timestamp block
+                if candle_timestamp != last_processed_timestamp:
+                    new_row = {
+                        "timestamp": candle_timestamp,
+                        "instrument_key": INSTRUMENT_KEY,
+                        "open": latest_candle[1],
+                        "high": latest_candle[2],
+                        "low": latest_candle[3],
+                        "close": latest_candle[4],
+                        "volume": latest_candle[5]
+                    }
+
+                    df = pd.DataFrame([new_row])
+                    file_exists = os.path.isfile(CSV_FILENAME)
+                    df.to_csv(CSV_FILENAME, mode="a", index=False, header=not file_exists)
+                    
+                    logger.info(f"Saved candle for timestamp: {candle_timestamp}")
+                    last_processed_timestamp = candle_timestamp
+
+        except ApiException as e:
+            logger.error(f"Upstox API Exception: {e}")
+            await asyncio.sleep(2) # Backoff briefly on API failure
         except Exception as e:
-            code = getattr(e, "code", None)
-            reason = getattr(e, "reason", None)
-            logger.error(f"Feed receive error: {e} (code={code}, reason={reason!r}).")
-
-            try:
-                await feed.disconnect()
-            except Exception:
-                pass  # already dead, nothing to clean up
-
-            if "429" in str(e):
-                backoff = max(backoff, 30)  # respect Dhan's rate limit explicitly
-
-            logger.error(f"Reconnecting in {backoff}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, max_backoff)
-
-            try:
-                await feed.connect()
-            except Exception as reconnect_err:
-                logger.error(f"Reconnect failed: {reconnect_err}")
-
-
-async def seconds_timer_loop():
-    while True:
-        now = time.time()
-        sleep_time = 1.0 - (now % 1.0)
-        await asyncio.sleep(sleep_time)
-        process_ticks_to_1s()
+            logger.error(f"Unexpected error in feed loop: {e}")
+            await asyncio.sleep(2)
 
 
 async def google_drive_sync_loop():
@@ -186,29 +135,20 @@ async def google_drive_sync_loop():
 
 
 async def main():
-    if not CLIENT_ID or not ACCESS_TOKEN:
-        logger.error("Dhan credentials (DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN) are missing!")
+    if not UPSTOX_ACCESS_TOKEN:
+        logger.error("Upstox access token (UPSTOX_ACCESS_TOKEN) is missing!")
         sys.exit(1)
 
-    dhan_context = DhanContext(client_id=CLIENT_ID, access_token=ACCESS_TOKEN)
-    feed = MarketFeed(
-        dhan_context=dhan_context,
-        instruments=INSTRUMENTS,
-        version="v2"
-    )
-    feed.on_connect = on_connect
-    # NOTE: feed.on_message is intentionally NOT wired here - the SDK only
-    # invokes it from inside its own run()/_run_async(), which we're not
-    # using so we can share the event loop with the timer/sync tasks below.
-    # feed_receive_loop() calls on_message() manually instead.
+    # Configure Upstox API client
+    configuration = upstox_client.Configuration()
+    configuration.access_token = UPSTOX_ACCESS_TOKEN
+    api_instance = upstox_client.HistoryApi(upstox_client.ApiClient(configuration))
 
     tasks = [
-        asyncio.create_task(feed_receive_loop(feed)),
-        asyncio.create_task(seconds_timer_loop()),
+        asyncio.create_task(fetch_upstox_candles_loop(api_instance)),
         asyncio.create_task(google_drive_sync_loop())
     ]
 
-    logger.info("Starting loops and WebSocket client connection...")
     await asyncio.gather(*tasks)
 
 
