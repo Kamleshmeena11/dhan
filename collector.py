@@ -8,7 +8,7 @@ import pandas as pd
 
 # Upstox SDK & Streaming Tools
 import upstox_client
-from upstox_client.feeder import MarketDataFeeder
+from upstox_client.feeder import MarketDataStreamerV3
 
 # Google Drive Modules
 from googleapiclient.discovery import build
@@ -111,55 +111,67 @@ async def google_drive_sync_loop():
         upload_to_drive()
 
 
-def on_market_update(feed_message):
-    """Callback function handled automatically by Upstox Feeder when a live tick is received."""
+def on_open():
+    logger.info("Successfully established connection to Upstox Market Stream Feed.")
+
+
+def on_message(feed_dict):
+    """
+    Callback invoked by MarketDataStreamerV3 for every decoded protobuf feed message.
+    feed_dict is already a plain dict (via protobuf json_format.MessageToDict).
+    """
     global tick_store
     try:
-        if "feeds" in feed_message and INSTRUMENT_KEY in feed_message["feeds"]:
-            tick_data = feed_message["feeds"][INSTRUMENT_KEY]
-            
-            # Extract Last Traded Price (LTP) from the live feed update frame
-            ltp = tick_data.get("ff", {}).get("marketFF", {}).get("ltpc", {}).get("ltp")
-            v = tick_data.get("ff", {}).get("marketFF", {}).get("ltpc", {}).get("v", 0)
+        feeds = feed_dict.get("feeds", {})
+        feed = feeds.get(INSTRUMENT_KEY)
+        if not feed:
+            return
 
-            if ltp is not None:
-                tick_store.append({
-                    "price": float(ltp),
-                    "volume": float(v)
-                })
+        full_feed = feed.get("fullFeed", {})
+
+        # NSE_INDEX instruments populate indexFF, not marketFF (indices have no
+        # traded-quantity/market-depth fields the way equities/derivatives do).
+        ltpc = full_feed.get("indexFF", {}).get("ltpc") \
+            or full_feed.get("marketFF", {}).get("ltpc") \
+            or feed.get("ltpc")
+
+        if not ltpc:
+            return
+
+        ltp = ltpc.get("ltp")
+        ltq = ltpc.get("ltq", 0)
+
+        if ltp is not None:
+            tick_store.append({
+                "price": float(ltp),
+                "volume": float(ltq)
+            })
     except Exception as e:
         logger.error(f"Error reading live feed update: {e}")
 
 
-def on_open(feeder_instance):
-    logger.info("Successfully established connection to Upstox Market Stream Feed.")
-    # Request stream in full mode for precision ticks
-    feeder_instance.subscribe([INSTRUMENT_KEY], "full")
-
-
-def on_error(feeder_instance, error):
+def on_error(error):
     logger.error(f"Upstox WebSocket Feed Error: {error}")
 
 
-def on_close(feeder_instance, close_status_code, close_msg):
+def on_close(close_status_code, close_msg):
     logger.info(f"WebSocket connection closed. Code: {close_status_code}, Msg: {close_msg}")
 
 
-async def run_feeder(token):
-    """Executes the standard Upstox Feeder engine cleanly on a background thread executor."""
-    api_client = upstox_client.ApiClient()
-    api_client.configuration.access_token = token
+def start_streamer(token):
+    """Configures and connects the MarketDataStreamerV3 (non-blocking; runs on its own thread)."""
+    configuration = upstox_client.Configuration()
+    configuration.access_token = token
+    api_client = upstox_client.ApiClient(configuration)
 
-    feeder = MarketDataFeeder(
-        api_client=api_client,
-        on_message=on_market_update,
-        on_open=on_open,
-        on_error=on_error,
-        on_close=on_close
-    )
-    
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, feeder.connect)
+    streamer = MarketDataStreamerV3(api_client, [INSTRUMENT_KEY], "full")
+    streamer.on("open", on_open)
+    streamer.on("message", on_message)
+    streamer.on("error", on_error)
+    streamer.on("close", on_close)
+
+    streamer.connect()  # spawns its own background thread; returns immediately
+    return streamer
 
 
 async def main():
@@ -167,14 +179,13 @@ async def main():
         logger.error("UPSTOX_ACCESS_TOKEN configuration secret is missing!")
         sys.exit(1)
 
-    tasks = [
-        asyncio.create_task(run_feeder(UPSTOX_ACCESS_TOKEN)),
-        asyncio.create_task(seconds_timer_loop()),
-        asyncio.create_task(google_drive_sync_loop())
-    ]
+    start_streamer(UPSTOX_ACCESS_TOKEN)
 
     logger.info("Starting up active 1s real-time loops...")
-    await asyncio.gather(*tasks)
+    await asyncio.gather(
+        seconds_timer_loop(),
+        google_drive_sync_loop(),
+    )
 
 
 if __name__ == "__main__":
