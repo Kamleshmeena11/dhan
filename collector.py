@@ -143,16 +143,49 @@ def _get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-def upload_file_to_drive(local_path: str, drive_filename: str):
-    """Uploads/replaces a single named file on Drive (flat namespace -- Drive
-    itself has no subfolders here, only the local disk is split by day)."""
+def get_or_create_drive_folder(service, name: str, parent_id: str = None) -> str:
+    """Finds a Drive folder by name (optionally scoped to a parent folder).
+    Creates it if it doesn't exist yet. Returns the folder's file ID."""
+    query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{name}' and trashed = false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    folders = results.get("files", [])
+    if folders:
+        return folders[0]["id"]
+
+    metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        metadata["parents"] = [parent_id]
+    folder = service.files().create(body=metadata, fields="id").execute()
+    logger.info(f"Created Drive folder '{name}'" + (f" inside parent {parent_id}" if parent_id else ""))
+    return folder["id"]
+
+
+def get_daily_drive_folder_id(service) -> str:
+    """Ensures data/daily/<date>/ has a matching daily/<date>/ folder on
+    Drive, creating either level if missing, and returns the date folder's ID."""
+    date_str = datetime.now(IST).strftime("%Y-%m-%d")
+    daily_folder_id = get_or_create_drive_folder(service, "daily")
+    date_folder_id = get_or_create_drive_folder(service, date_str, parent_id=daily_folder_id)
+    return date_folder_id
+
+
+def upload_file_to_drive(local_path: str, drive_filename: str, parent_id: str = None):
+    """Uploads/replaces a single named file on Drive. If parent_id is given,
+    the file is created/matched inside that folder instead of Drive's root."""
     if not os.path.exists(local_path):
         return
     if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
         return
     try:
         service = _get_drive_service()
+        if parent_id is None:
+            parent_id = get_daily_drive_folder_id(service) if drive_filename != COMBINED_FILENAME else None
+
         query = f"name = '{drive_filename}' and trashed = false"
+        if parent_id:
+            query += f" and '{parent_id}' in parents"
         results = service.files().list(q=query, fields="files(id)").execute()
         files = results.get("files", [])
         media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
@@ -161,12 +194,14 @@ def upload_file_to_drive(local_path: str, drive_filename: str):
             service.files().update(fileId=file_id, media_body=media).execute()
         else:
             file_metadata = {"name": drive_filename}
+            if parent_id:
+                file_metadata["parents"] = [parent_id]
             service.files().create(body=file_metadata, media_body=media).execute()
     except Exception as e:
         logger.error(f"Google Drive Sync Failure ({drive_filename}): {e}")
 
 
-def download_file_from_drive(drive_filename: str, local_path: str):
+def download_file_from_drive(drive_filename: str, local_path: str, parent_id: str = None):
     """Pulls an existing Drive file down to local_path if one exists. Used at
     startup so history isn't lost -- GitHub Actions runners start with an
     empty disk every run, so without this, each new run would overwrite the
@@ -176,7 +211,12 @@ def download_file_from_drive(drive_filename: str, local_path: str):
         return
     try:
         service = _get_drive_service()
+        if parent_id is None and drive_filename != COMBINED_FILENAME:
+            parent_id = get_daily_drive_folder_id(service)
+
         query = f"name = '{drive_filename}' and trashed = false"
+        if parent_id:
+            query += f" and '{parent_id}' in parents"
         results = service.files().list(q=query, fields="files(id)").execute()
         files = results.get("files", [])
         if not files:
@@ -217,6 +257,8 @@ async def google_drive_sync_loop():
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
         daily_path = get_daily_path(today_str)
         daily_drive_name = os.path.basename(daily_path)
+        # parent_id=None here triggers upload_file_to_drive's own
+        # find-or-create of Drive's daily/<date>/ folder for this file.
         await asyncio.to_thread(upload_file_to_drive, daily_path, daily_drive_name)
         await asyncio.to_thread(upload_file_to_drive, COMBINED_PATH, COMBINED_FILENAME)
 
