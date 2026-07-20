@@ -30,24 +30,37 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # --- Configuration & Credentials ---
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
-INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
+
+# Instruments being tracked. "label" drives every filename below --
+# nifty_2026-07-20.csv / nifty_ALL.csv, bank_nifty_2026-07-20.csv / bank_nifty_ALL.csv.
+INSTRUMENTS = {
+    "NSE_INDEX|Nifty 50": {"label": "nifty"},
+    "NSE_INDEX|Nifty Bank": {"label": "bank_nifty"},
+}
 
 # Folder layout:
 #   data/
 #     daily/
-#       2026-07-20/candles_1s_upstox_2026-07-20.csv   <- one folder+file per day
-#       2026-07-21/candles_1s_upstox_2026-07-21.csv
-#     candles_1s_upstox_ALL.csv                        <- every day's rows combined
+#       2026-07-20/nifty_2026-07-20.csv        <- one folder per day, one file per instrument
+#       2026-07-20/bank_nifty_2026-07-20.csv
+#     nifty_ALL.csv                            <- every day's Nifty rows combined
+#     bank_nifty_ALL.csv                       <- every day's Bank Nifty rows combined
 BASE_DATA_DIR = "data"
 DAILY_DIR = os.path.join(BASE_DATA_DIR, "daily")
-COMBINED_FILENAME = "candles_1s_upstox_ALL.csv"
-COMBINED_PATH = os.path.join(BASE_DATA_DIR, COMBINED_FILENAME)
 
 
-def get_daily_path(date_str: str) -> str:
-    """Returns the per-day CSV path, always nested inside DAILY_DIR,
-    e.g. data/daily/2026-07-20/candles_1s_upstox_2026-07-20.csv"""
-    return os.path.join(DAILY_DIR, date_str, f"candles_1s_upstox_{date_str}.csv")
+def get_daily_path(label: str, date_str: str) -> str:
+    """Per-day, per-instrument CSV path, always nested inside DAILY_DIR,
+    e.g. data/daily/2026-07-20/nifty_2026-07-20.csv"""
+    return os.path.join(DAILY_DIR, date_str, f"{label}_{date_str}.csv")
+
+
+def get_combined_filename(label: str) -> str:
+    return f"{label}_ALL.csv"
+
+
+def get_combined_path(label: str) -> str:
+    return os.path.join(BASE_DATA_DIR, get_combined_filename(label))
 
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
@@ -57,8 +70,9 @@ GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 # Ticks are bucketed by their OWN exchange timestamp (ltt from Upstox's feed),
 # NOT by local arrival time. Arrival time is skewed by network/processing
 # jitter, which is exactly what caused OHLC values to mismatch Upstox's own
-# per-second data for a bar with the same label. Key = epoch second (int).
-tick_buckets = {}
+# per-second data for a bar with the same label. Structure:
+#   tick_buckets[instrument_key][epoch_second] = [ {price, volume}, ... ]
+tick_buckets = {key: {} for key in INSTRUMENTS}
 
 # How many seconds we hold a bucket open after its second has technically
 # elapsed, before finalizing/writing it. This exists ONLY to give slightly
@@ -66,10 +80,10 @@ tick_buckets = {}
 # the right bucket. Larger = more accurate vs Upstox, smaller = less delay.
 BUFFER_SECONDS = 2
 
-# The last epoch-second we've already finalized (written or logged as a
-# gap). Used to walk forward one second at a time so no second is ever
-# silently skipped, whether the broker sent nothing or the process stalled.
-last_flushed_epoch = None
+# The last epoch-second we've already finalized per instrument (written or
+# logged as a gap). Used to walk forward one second at a time so no second
+# is ever silently skipped, whether the broker sent nothing or the process stalled.
+last_flushed_epoch = {key: None for key in INSTRUMENTS}
 
 
 def append_row_to_csv(path: str, row: dict):
@@ -79,10 +93,12 @@ def append_row_to_csv(path: str, row: dict):
     df.to_csv(path, mode="a", index=False, header=not file_exists)
 
 
-def write_bar(bar_time: datetime, ticks: list):
-    """Writes one finalized 1s OHLCV bar built entirely from ticks whose own
-    exchange timestamp (ltt) falls in this second -- to BOTH that day's
-    dedicated file and the running all-days combined file."""
+def write_bar(instrument_key: str, bar_time: datetime, ticks: list):
+    """Writes one finalized 1s OHLCV bar for a specific instrument, built
+    entirely from ticks whose own exchange timestamp (ltt) falls in this
+    second -- to BOTH that day's dedicated file and that instrument's
+    running all-days combined file."""
+    label = INSTRUMENTS[instrument_key]["label"]
     bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
     date_str = bar_time.strftime("%Y-%m-%d")
     tick_count = len(ticks)
@@ -91,7 +107,7 @@ def write_bar(bar_time: datetime, ticks: list):
 
     new_row = {
         "timestamp": bar_str,
-        "instrument_key": INSTRUMENT_KEY,
+        "instrument_key": instrument_key,
         "open": prices[0],
         "high": max(prices),
         "low": min(prices),
@@ -99,37 +115,40 @@ def write_bar(bar_time: datetime, ticks: list):
         "volume": sum(volumes)
     }
 
-    append_row_to_csv(get_daily_path(date_str), new_row)
-    append_row_to_csv(COMBINED_PATH, new_row)
-    logger.info(f"Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | ticks: {tick_count}")
+    append_row_to_csv(get_daily_path(label, date_str), new_row)
+    append_row_to_csv(get_combined_path(label), new_row)
+    logger.info(f"[{label}] Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | ticks: {tick_count}")
 
 
 def flush_ready_buckets():
-    """Walks forward second-by-second from the last finalized second up to
-    (now - BUFFER_SECONDS), writing or gap-logging each one. Ticks arriving
-    late for an already-finalized second are impossible by construction,
-    since we never finalize a second until BUFFER_SECONDS have passed."""
+    """For every tracked instrument, walks forward second-by-second from the
+    last finalized second up to (now - BUFFER_SECONDS), writing or gap-logging
+    each one. Ticks arriving late for an already-finalized second are
+    impossible by construction, since we never finalize a second until
+    BUFFER_SECONDS have passed."""
     global tick_buckets, last_flushed_epoch
 
     now_epoch = int(time.time())
     cutoff = now_epoch - BUFFER_SECONDS  # newest second considered "settled"
 
-    if last_flushed_epoch is None:
-        # First run: don't dump/backfill history, just start the walk from here.
-        last_flushed_epoch = cutoff - 1
-        return
+    for instrument_key, label_info in INSTRUMENTS.items():
+        label = label_info["label"]
 
-    for epoch_sec in range(last_flushed_epoch + 1, cutoff + 1):
-        bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
-        bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
-        ticks = tick_buckets.pop(epoch_sec, None)
-        if not ticks:
-            logger.warning(f"NO TICKS received for bar {bar_str} IST - broker delivery gap, bar skipped")
+        if last_flushed_epoch[instrument_key] is None:
+            # First run: don't dump/backfill history, just start the walk from here.
+            last_flushed_epoch[instrument_key] = cutoff - 1
             continue
-        write_bar(bar_time, ticks)
 
-    last_flushed_epoch = cutoff
+        for epoch_sec in range(last_flushed_epoch[instrument_key] + 1, cutoff + 1):
+            bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
+            bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
+            ticks = tick_buckets[instrument_key].pop(epoch_sec, None)
+            if not ticks:
+                logger.warning(f"[{label}] NO TICKS received for bar {bar_str} IST - broker delivery gap, bar skipped")
+                continue
+            write_bar(instrument_key, bar_time, ticks)
 
+        last_flushed_epoch[instrument_key] = cutoff
 
 
 def _get_drive_service():
@@ -164,24 +183,30 @@ def get_or_create_drive_folder(service, name: str, parent_id: str = None) -> str
 
 def get_daily_drive_folder_id(service) -> str:
     """Ensures data/daily/<date>/ has a matching daily/<date>/ folder on
-    Drive, creating either level if missing, and returns the date folder's ID."""
+    Drive (shared by all instruments), creating either level if missing,
+    and returns the date folder's ID."""
     date_str = datetime.now(IST).strftime("%Y-%m-%d")
     daily_folder_id = get_or_create_drive_folder(service, "daily")
     date_folder_id = get_or_create_drive_folder(service, date_str, parent_id=daily_folder_id)
     return date_folder_id
 
 
+def _is_combined_filename(drive_filename: str) -> bool:
+    return drive_filename in {get_combined_filename(info["label"]) for info in INSTRUMENTS.values()}
+
+
 def upload_file_to_drive(local_path: str, drive_filename: str, parent_id: str = None):
     """Uploads/replaces a single named file on Drive. If parent_id is given,
-    the file is created/matched inside that folder instead of Drive's root."""
+    the file is created/matched inside that folder instead of Drive's root.
+    Daily files auto-resolve into daily/<date>/; combined files stay at root."""
     if not os.path.exists(local_path):
         return
     if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
         return
     try:
         service = _get_drive_service()
-        if parent_id is None:
-            parent_id = get_daily_drive_folder_id(service) if drive_filename != COMBINED_FILENAME else None
+        if parent_id is None and not _is_combined_filename(drive_filename):
+            parent_id = get_daily_drive_folder_id(service)
 
         query = f"name = '{drive_filename}' and trashed = false"
         if parent_id:
@@ -211,7 +236,7 @@ def download_file_from_drive(drive_filename: str, local_path: str, parent_id: st
         return
     try:
         service = _get_drive_service()
-        if parent_id is None and drive_filename != COMBINED_FILENAME:
+        if parent_id is None and not _is_combined_filename(drive_filename):
             parent_id = get_daily_drive_folder_id(service)
 
         query = f"name = '{drive_filename}' and trashed = false"
@@ -251,16 +276,16 @@ async def seconds_timer_loop():
 async def google_drive_sync_loop():
     while True:
         await asyncio.sleep(10)
-        # Both uploads are blocking HTTP calls -- run each on a worker thread
+        # All uploads are blocking HTTP calls -- run each on a worker thread
         # so they can never freeze seconds_timer_loop (that's what caused
         # entire 1s bars to go missing right after every sync, before).
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        daily_path = get_daily_path(today_str)
-        daily_drive_name = os.path.basename(daily_path)
-        # parent_id=None here triggers upload_file_to_drive's own
-        # find-or-create of Drive's daily/<date>/ folder for this file.
-        await asyncio.to_thread(upload_file_to_drive, daily_path, daily_drive_name)
-        await asyncio.to_thread(upload_file_to_drive, COMBINED_PATH, COMBINED_FILENAME)
+        for info in INSTRUMENTS.values():
+            label = info["label"]
+            daily_path = get_daily_path(label, today_str)
+            daily_drive_name = os.path.basename(daily_path)
+            await asyncio.to_thread(upload_file_to_drive, daily_path, daily_drive_name)
+            await asyncio.to_thread(upload_file_to_drive, get_combined_path(label), get_combined_filename(label))
 
 
 def on_open():
@@ -271,47 +296,49 @@ def on_message(feed_dict):
     """
     Callback invoked by MarketDataStreamerV3 for every decoded protobuf feed message.
     feed_dict is already a plain dict (via protobuf json_format.MessageToDict).
+    Handles every subscribed instrument present in this message, not just one.
     """
     global tick_buckets
     try:
         feeds = feed_dict.get("feeds", {})
-        feed = feeds.get(INSTRUMENT_KEY)
-        if not feed:
-            return
+        for instrument_key in INSTRUMENTS:
+            feed = feeds.get(instrument_key)
+            if not feed:
+                continue
 
-        full_feed = feed.get("fullFeed", {})
+            full_feed = feed.get("fullFeed", {})
 
-        # NSE_INDEX instruments populate indexFF, not marketFF (indices have no
-        # traded-quantity/market-depth fields the way equities/derivatives do).
-        ltpc = full_feed.get("indexFF", {}).get("ltpc") \
-            or full_feed.get("marketFF", {}).get("ltpc") \
-            or feed.get("ltpc")
+            # NSE_INDEX instruments populate indexFF, not marketFF (indices have no
+            # traded-quantity/market-depth fields the way equities/derivatives do).
+            ltpc = full_feed.get("indexFF", {}).get("ltpc") \
+                or full_feed.get("marketFF", {}).get("ltpc") \
+                or feed.get("ltpc")
 
-        if not ltpc:
-            return
+            if not ltpc:
+                continue
 
-        ltp = ltpc.get("ltp")
-        ltq = ltpc.get("ltq", 0)
-        ltt = ltpc.get("ltt")  # exchange timestamp of this trade, epoch millis
+            ltp = ltpc.get("ltp")
+            ltq = ltpc.get("ltq", 0)
+            ltt = ltpc.get("ltt")  # exchange timestamp of this trade, epoch millis
 
-        if ltp is None:
-            return
+            if ltp is None:
+                continue
 
-        # Bucket by the tick's OWN exchange second, not local receipt time.
-        if ltt is not None:
-            try:
-                tick_epoch_sec = int(ltt) // 1000
-            except (TypeError, ValueError):
+            # Bucket by the tick's OWN exchange second, not local receipt time.
+            if ltt is not None:
+                try:
+                    tick_epoch_sec = int(ltt) // 1000
+                except (TypeError, ValueError):
+                    tick_epoch_sec = int(time.time())
+                    logger.warning(f"[{instrument_key}] ltt field unparseable ({ltt!r}) - falling back to local arrival time for this tick")
+            else:
                 tick_epoch_sec = int(time.time())
-                logger.warning(f"ltt field unparseable ({ltt!r}) - falling back to local arrival time for this tick")
-        else:
-            tick_epoch_sec = int(time.time())
-            logger.warning("ltt field missing from tick - falling back to local arrival time for this tick")
+                logger.warning(f"[{instrument_key}] ltt field missing from tick - falling back to local arrival time for this tick")
 
-        tick_buckets.setdefault(tick_epoch_sec, []).append({
-            "price": float(ltp),
-            "volume": float(ltq)
-        })
+            tick_buckets[instrument_key].setdefault(tick_epoch_sec, []).append({
+                "price": float(ltp),
+                "volume": float(ltq)
+            })
     except Exception as e:
         logger.error(f"Error reading live feed update: {e}")
 
@@ -330,7 +357,7 @@ def start_streamer(token):
     configuration.access_token = token
     api_client = upstox_client.ApiClient(configuration)
 
-    streamer = MarketDataStreamerV3(api_client, [INSTRUMENT_KEY], "full")
+    streamer = MarketDataStreamerV3(api_client, list(INSTRUMENTS.keys()), "full")
     streamer.on("open", on_open)
     streamer.on("message", on_message)
     streamer.on("error", on_error)
@@ -351,13 +378,15 @@ async def main():
     # Without this, a fresh GitHub Actions runner would locally start both
     # files empty and the next sync would overwrite Drive's copies too.
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    daily_path = get_daily_path(today_str)
-    await asyncio.to_thread(download_file_from_drive, os.path.basename(daily_path), daily_path)
-    await asyncio.to_thread(download_file_from_drive, COMBINED_FILENAME, COMBINED_PATH)
+    for info in INSTRUMENTS.values():
+        label = info["label"]
+        daily_path = get_daily_path(label, today_str)
+        await asyncio.to_thread(download_file_from_drive, os.path.basename(daily_path), daily_path)
+        await asyncio.to_thread(download_file_from_drive, get_combined_filename(label), get_combined_path(label))
 
     start_streamer(UPSTOX_ACCESS_TOKEN)
 
-    logger.info("Starting up active 1s real-time loops (timestamps in IST)...")
+    logger.info("Starting up active 1s real-time loops (timestamps in IST) for: " + ", ".join(INSTRUMENTS.keys()))
     await asyncio.gather(
         seconds_timer_loop(),
         google_drive_sync_loop(),
