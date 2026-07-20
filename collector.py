@@ -119,7 +119,11 @@ async def seconds_timer_loop():
         boundary_epoch = now + sleep_time  # the exact second boundary we're waiting for
         await asyncio.sleep(sleep_time)
 
-        bar_time = datetime.fromtimestamp(boundary_epoch, tz=IST)
+        # Ticks just flushed were collected during [boundary_epoch - 1, boundary_epoch),
+        # i.e. the second that just ELAPSED, not the second we just landed on.
+        # Label the bar with the start of that window so it matches Upstox's own
+        # per-tick timestamps (10:05:03 ticks -> bar "10:05:03", not "10:05:04").
+        bar_time = datetime.fromtimestamp(boundary_epoch - 1.0, tz=IST)
         process_ticks_to_1s(bar_time)
 
 
