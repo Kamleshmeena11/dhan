@@ -34,17 +34,20 @@ INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
 
 # Folder layout:
 #   data/
-#     2026-07-20/candles_1s_upstox_2026-07-20.csv   <- one folder+file per day
-#     2026-07-21/candles_1s_upstox_2026-07-21.csv
-#     candles_1s_upstox_ALL.csv                     <- every day's rows combined
+#     daily/
+#       2026-07-20/candles_1s_upstox_2026-07-20.csv   <- one folder+file per day
+#       2026-07-21/candles_1s_upstox_2026-07-21.csv
+#     candles_1s_upstox_ALL.csv                        <- every day's rows combined
 BASE_DATA_DIR = "data"
+DAILY_DIR = os.path.join(BASE_DATA_DIR, "daily")
 COMBINED_FILENAME = "candles_1s_upstox_ALL.csv"
 COMBINED_PATH = os.path.join(BASE_DATA_DIR, COMBINED_FILENAME)
 
 
 def get_daily_path(date_str: str) -> str:
-    """Returns the per-day CSV path, e.g. data/2026-07-20/candles_1s_upstox_2026-07-20.csv"""
-    return os.path.join(BASE_DATA_DIR, date_str, f"candles_1s_upstox_{date_str}.csv")
+    """Returns the per-day CSV path, always nested inside DAILY_DIR,
+    e.g. data/daily/2026-07-20/candles_1s_upstox_2026-07-20.csv"""
+    return os.path.join(DAILY_DIR, date_str, f"candles_1s_upstox_{date_str}.csv")
 
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
