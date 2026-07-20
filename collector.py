@@ -39,6 +39,10 @@ GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 # Global memory array to store streaming raw ticks inside the 1-second interval window
 tick_store = []
 
+# Tracks the timestamp of the last bar actually written, so we can detect
+# any skipped seconds (event loop stalls, reconnects, etc.) between bars.
+last_bar_time = None
+
 
 def process_ticks_to_1s(bar_time: datetime):
     """Compiles all raw stream ticks collected over the past second into an OHLCV bar.
@@ -47,17 +51,38 @@ def process_ticks_to_1s(bar_time: datetime):
     timer loop BEFORE any processing happens), not the wall-clock time at the
     moment this function actually runs. That's what removes the ~1s lag.
     """
-    global tick_store
+    global tick_store, last_bar_time
+
+    bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # --- GAP DEBUG 1: did we skip whole second(s) since the last bar? ---
+    # This catches event-loop stalls, WebSocket reconnects, or the script
+    # hanging -- anything that stops seconds_timer_loop from firing on time.
+    if last_bar_time is not None:
+        gap = round((bar_time - last_bar_time).total_seconds())
+        if gap > 1:
+            missing_seconds = gap - 1
+            logger.warning(
+                f"DATA GAP: {missing_seconds} whole second(s) missing between "
+                f"{last_bar_time.strftime('%Y-%m-%d %H:%M:%S')} and {bar_str} IST "
+                f"(no bars written for that span, no fabricated/forward-filled data)"
+            )
+    last_bar_time = bar_time
+
+    # --- GAP DEBUG 2: did the broker send us zero ticks this second? ---
+    # Confirmed cause (per Fyers collector history) is broker-side delivery
+    # failure, not the index actually going silent. Log it plainly instead of
+    # silently skipping -- an empty bar is still information.
     if not tick_store:
+        logger.warning(f"NO TICKS received for bar {bar_str} IST - broker delivery gap, bar skipped")
         return
 
-    timestamp_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
-
+    tick_count = len(tick_store)
     prices = [t["price"] for t in tick_store]
     volumes = [t.get("volume", 0) for t in tick_store]
 
     new_row = {
-        "timestamp": timestamp_str,
+        "timestamp": bar_str,
         "instrument_key": INSTRUMENT_KEY,
         "open": prices[0],
         "high": max(prices),
@@ -73,7 +98,7 @@ def process_ticks_to_1s(bar_time: datetime):
     df = pd.DataFrame([new_row])
     file_exists = os.path.isfile(CSV_FILENAME)
     df.to_csv(CSV_FILENAME, mode="a", index=False, header=not file_exists)
-    logger.info(f"Saved 1s Bar -> {timestamp_str} IST | Close: {new_row['close']}")
+    logger.info(f"Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | ticks: {tick_count}")
 
 
 def upload_to_drive():
