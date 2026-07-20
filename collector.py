@@ -36,50 +36,31 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 
-# Global memory array to store streaming raw ticks inside the 1-second interval window
-tick_store = []
+# Ticks are bucketed by their OWN exchange timestamp (ltt from Upstox's feed),
+# NOT by local arrival time. Arrival time is skewed by network/processing
+# jitter, which is exactly what caused OHLC values to mismatch Upstox's own
+# per-second data for a bar with the same label. Key = epoch second (int).
+tick_buckets = {}
 
-# Tracks the timestamp of the last bar actually written, so we can detect
-# any skipped seconds (event loop stalls, reconnects, etc.) between bars.
-last_bar_time = None
+# How many seconds we hold a bucket open after its second has technically
+# elapsed, before finalizing/writing it. This exists ONLY to give slightly
+# late-arriving ticks (still stamped with the correct ltt) time to land in
+# the right bucket. Larger = more accurate vs Upstox, smaller = less delay.
+BUFFER_SECONDS = 2
+
+# The last epoch-second we've already finalized (written or logged as a
+# gap). Used to walk forward one second at a time so no second is ever
+# silently skipped, whether the broker sent nothing or the process stalled.
+last_flushed_epoch = None
 
 
-def process_ticks_to_1s(bar_time: datetime):
-    """Compiles all raw stream ticks collected over the past second into an OHLCV bar.
-
-    bar_time is the exact second boundary this bar belongs to (computed by the
-    timer loop BEFORE any processing happens), not the wall-clock time at the
-    moment this function actually runs. That's what removes the ~1s lag.
-    """
-    global tick_store, last_bar_time
-
+def write_bar(bar_time: datetime, ticks: list):
+    """Writes one finalized 1s OHLCV bar built entirely from ticks whose own
+    exchange timestamp (ltt) falls in this second."""
     bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
-
-    # --- GAP DEBUG 1: did we skip whole second(s) since the last bar? ---
-    # This catches event-loop stalls, WebSocket reconnects, or the script
-    # hanging -- anything that stops seconds_timer_loop from firing on time.
-    if last_bar_time is not None:
-        gap = round((bar_time - last_bar_time).total_seconds())
-        if gap > 1:
-            missing_seconds = gap - 1
-            logger.warning(
-                f"DATA GAP: {missing_seconds} whole second(s) missing between "
-                f"{last_bar_time.strftime('%Y-%m-%d %H:%M:%S')} and {bar_str} IST "
-                f"(no bars written for that span, no fabricated/forward-filled data)"
-            )
-    last_bar_time = bar_time
-
-    # --- GAP DEBUG 2: did the broker send us zero ticks this second? ---
-    # Confirmed cause (per Fyers collector history) is broker-side delivery
-    # failure, not the index actually going silent. Log it plainly instead of
-    # silently skipping -- an empty bar is still information.
-    if not tick_store:
-        logger.warning(f"NO TICKS received for bar {bar_str} IST - broker delivery gap, bar skipped")
-        return
-
-    tick_count = len(tick_store)
-    prices = [t["price"] for t in tick_store]
-    volumes = [t.get("volume", 0) for t in tick_store]
+    tick_count = len(ticks)
+    prices = [t["price"] for t in ticks]
+    volumes = [t.get("volume", 0) for t in ticks]
 
     new_row = {
         "timestamp": bar_str,
@@ -91,14 +72,37 @@ def process_ticks_to_1s(bar_time: datetime):
         "volume": sum(volumes)
     }
 
-    # Wipe queue clean for the next second's window immediately
-    tick_store = []
-
-    # Write data row straight to the destination CSV
     df = pd.DataFrame([new_row])
     file_exists = os.path.isfile(CSV_FILENAME)
     df.to_csv(CSV_FILENAME, mode="a", index=False, header=not file_exists)
     logger.info(f"Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | ticks: {tick_count}")
+
+
+def flush_ready_buckets():
+    """Walks forward second-by-second from the last finalized second up to
+    (now - BUFFER_SECONDS), writing or gap-logging each one. Ticks arriving
+    late for an already-finalized second are impossible by construction,
+    since we never finalize a second until BUFFER_SECONDS have passed."""
+    global tick_buckets, last_flushed_epoch
+
+    now_epoch = int(time.time())
+    cutoff = now_epoch - BUFFER_SECONDS  # newest second considered "settled"
+
+    if last_flushed_epoch is None:
+        # First run: don't dump/backfill history, just start the walk from here.
+        last_flushed_epoch = cutoff - 1
+        return
+
+    for epoch_sec in range(last_flushed_epoch + 1, cutoff + 1):
+        bar_time = datetime.fromtimestamp(epoch_sec, tz=IST)
+        bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
+        ticks = tick_buckets.pop(epoch_sec, None)
+        if not ticks:
+            logger.warning(f"NO TICKS received for bar {bar_str} IST - broker delivery gap, bar skipped")
+            continue
+        write_bar(bar_time, ticks)
+
+    last_flushed_epoch = cutoff
 
 
 def upload_to_drive():
@@ -130,26 +134,15 @@ def upload_to_drive():
 
 
 async def seconds_timer_loop():
-    """Triggers the OHLC computation loop precisely at the turn of every clock second.
-
-    Key fix: the boundary time is computed HERE, right before sleeping to it,
-    and handed to process_ticks_to_1s(). The old code called datetime.now()
-    a second time *inside* process_ticks_to_1s(), after the sleep + any event
-    loop scheduling jitter had already elapsed -- which is exactly what made
-    every printed bar look ~1s (or more, under load) behind the real tick.
-    """
+    """Periodically triggers flush_ready_buckets(). Wake-time precision no
+    longer matters for correctness -- bars are labeled and bucketed using
+    each tick's own exchange timestamp (ltt), not this loop's timing. This
+    loop just needs to run roughly once a second so buckets don't pile up."""
     while True:
         now = time.time()
         sleep_time = 1.0 - (now % 1.0)
-        boundary_epoch = now + sleep_time  # the exact second boundary we're waiting for
         await asyncio.sleep(sleep_time)
-
-        # Ticks just flushed were collected during [boundary_epoch - 1, boundary_epoch),
-        # i.e. the second that just ELAPSED, not the second we just landed on.
-        # Label the bar with the start of that window so it matches Upstox's own
-        # per-tick timestamps (10:05:03 ticks -> bar "10:05:03", not "10:05:04").
-        bar_time = datetime.fromtimestamp(boundary_epoch - 1.0, tz=IST)
-        process_ticks_to_1s(bar_time)
+        flush_ready_buckets()
 
 
 async def google_drive_sync_loop():
@@ -172,7 +165,7 @@ def on_message(feed_dict):
     Callback invoked by MarketDataStreamerV3 for every decoded protobuf feed message.
     feed_dict is already a plain dict (via protobuf json_format.MessageToDict).
     """
-    global tick_store
+    global tick_buckets
     try:
         feeds = feed_dict.get("feeds", {})
         feed = feeds.get(INSTRUMENT_KEY)
@@ -192,12 +185,26 @@ def on_message(feed_dict):
 
         ltp = ltpc.get("ltp")
         ltq = ltpc.get("ltq", 0)
+        ltt = ltpc.get("ltt")  # exchange timestamp of this trade, epoch millis
 
-        if ltp is not None:
-            tick_store.append({
-                "price": float(ltp),
-                "volume": float(ltq)
-            })
+        if ltp is None:
+            return
+
+        # Bucket by the tick's OWN exchange second, not local receipt time.
+        if ltt is not None:
+            try:
+                tick_epoch_sec = int(ltt) // 1000
+            except (TypeError, ValueError):
+                tick_epoch_sec = int(time.time())
+                logger.warning(f"ltt field unparseable ({ltt!r}) - falling back to local arrival time for this tick")
+        else:
+            tick_epoch_sec = int(time.time())
+            logger.warning("ltt field missing from tick - falling back to local arrival time for this tick")
+
+        tick_buckets.setdefault(tick_epoch_sec, []).append({
+            "price": float(ltp),
+            "volume": float(ltq)
+        })
     except Exception as e:
         logger.error(f"Error reading live feed update: {e}")
 
