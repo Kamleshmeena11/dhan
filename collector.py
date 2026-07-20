@@ -12,8 +12,9 @@ import upstox_client
 from upstox_client.feeder import MarketDataStreamerV3
 
 # Google Drive Modules
+import io
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
 
 # --- Logging Setup ---
@@ -30,7 +31,21 @@ IST = ZoneInfo("Asia/Kolkata")
 # --- Configuration & Credentials ---
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
 INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
-CSV_FILENAME = "candles_1s_upstox.csv"
+
+# Folder layout:
+#   data/
+#     2026-07-20/candles_1s_upstox_2026-07-20.csv   <- one folder+file per day
+#     2026-07-21/candles_1s_upstox_2026-07-21.csv
+#     candles_1s_upstox_ALL.csv                     <- every day's rows combined
+BASE_DATA_DIR = "data"
+COMBINED_FILENAME = "candles_1s_upstox_ALL.csv"
+COMBINED_PATH = os.path.join(BASE_DATA_DIR, COMBINED_FILENAME)
+
+
+def get_daily_path(date_str: str) -> str:
+    """Returns the per-day CSV path, e.g. data/2026-07-20/candles_1s_upstox_2026-07-20.csv"""
+    return os.path.join(BASE_DATA_DIR, date_str, f"candles_1s_upstox_{date_str}.csv")
+
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
@@ -54,10 +69,19 @@ BUFFER_SECONDS = 2
 last_flushed_epoch = None
 
 
+def append_row_to_csv(path: str, row: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df = pd.DataFrame([row])
+    file_exists = os.path.isfile(path)
+    df.to_csv(path, mode="a", index=False, header=not file_exists)
+
+
 def write_bar(bar_time: datetime, ticks: list):
     """Writes one finalized 1s OHLCV bar built entirely from ticks whose own
-    exchange timestamp (ltt) falls in this second."""
+    exchange timestamp (ltt) falls in this second -- to BOTH that day's
+    dedicated file and the running all-days combined file."""
     bar_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
+    date_str = bar_time.strftime("%Y-%m-%d")
     tick_count = len(ticks)
     prices = [t["price"] for t in ticks]
     volumes = [t.get("volume", 0) for t in ticks]
@@ -72,9 +96,8 @@ def write_bar(bar_time: datetime, ticks: list):
         "volume": sum(volumes)
     }
 
-    df = pd.DataFrame([new_row])
-    file_exists = os.path.isfile(CSV_FILENAME)
-    df.to_csv(CSV_FILENAME, mode="a", index=False, header=not file_exists)
+    append_row_to_csv(get_daily_path(date_str), new_row)
+    append_row_to_csv(COMBINED_PATH, new_row)
     logger.info(f"Saved 1s Bar -> {bar_str} IST | Close: {new_row['close']} | ticks: {tick_count}")
 
 
@@ -105,32 +128,69 @@ def flush_ready_buckets():
     last_flushed_epoch = cutoff
 
 
-def upload_to_drive():
-    if not os.path.exists(CSV_FILENAME):
+
+def _get_drive_service():
+    creds = Credentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET
+    )
+    return build("drive", "v3", credentials=creds)
+
+
+def upload_file_to_drive(local_path: str, drive_filename: str):
+    """Uploads/replaces a single named file on Drive (flat namespace -- Drive
+    itself has no subfolders here, only the local disk is split by day)."""
+    if not os.path.exists(local_path):
         return
     if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
         return
     try:
-        creds = Credentials(
-            token=None,
-            refresh_token=GOOGLE_REFRESH_TOKEN,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=GOOGLE_CLIENT_SECRET
-        )
-        service = build("drive", "v3", credentials=creds)
-        query = f"name = '{CSV_FILENAME}' and trashed = false"
+        service = _get_drive_service()
+        query = f"name = '{drive_filename}' and trashed = false"
         results = service.files().list(q=query, fields="files(id)").execute()
         files = results.get("files", [])
-        media = MediaFileUpload(CSV_FILENAME, mimetype="text/csv", resumable=True)
+        media = MediaFileUpload(local_path, mimetype="text/csv", resumable=True)
         if files:
             file_id = files[0]["id"]
             service.files().update(fileId=file_id, media_body=media).execute()
         else:
-            file_metadata = {"name": CSV_FILENAME}
+            file_metadata = {"name": drive_filename}
             service.files().create(body=file_metadata, media_body=media).execute()
     except Exception as e:
-        logger.error(f"Google Drive Sync Failure: {e}")
+        logger.error(f"Google Drive Sync Failure ({drive_filename}): {e}")
+
+
+def download_file_from_drive(drive_filename: str, local_path: str):
+    """Pulls an existing Drive file down to local_path if one exists. Used at
+    startup so history isn't lost -- GitHub Actions runners start with an
+    empty disk every run, so without this, each new run would overwrite the
+    combined file (and a same-day restart would overwrite that day's file)
+    with just the current run's data instead of adding to it."""
+    if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN]):
+        return
+    try:
+        service = _get_drive_service()
+        query = f"name = '{drive_filename}' and trashed = false"
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get("files", [])
+        if not files:
+            return
+        file_id = files[0]["id"]
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+        request = service.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        with open(local_path, "wb") as f:
+            f.write(buf.getvalue())
+        logger.info(f"Resumed existing '{drive_filename}' from Drive -> {local_path}")
+    except Exception as e:
+        logger.error(f"Google Drive Resume/Download Failure ({drive_filename}): {e}")
 
 
 async def seconds_timer_loop():
@@ -148,12 +208,14 @@ async def seconds_timer_loop():
 async def google_drive_sync_loop():
     while True:
         await asyncio.sleep(10)
-        # upload_to_drive() is a blocking synchronous HTTP call. Running it
-        # directly on the event loop freezes seconds_timer_loop for however
-        # long the request takes (~1-3s here), which is exactly what caused
-        # entire 1s bars to go missing right after every sync. to_thread()
-        # runs it on a worker thread so the per-second timer keeps firing.
-        await asyncio.to_thread(upload_to_drive)
+        # Both uploads are blocking HTTP calls -- run each on a worker thread
+        # so they can never freeze seconds_timer_loop (that's what caused
+        # entire 1s bars to go missing right after every sync, before).
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        daily_path = get_daily_path(today_str)
+        daily_drive_name = os.path.basename(daily_path)
+        await asyncio.to_thread(upload_file_to_drive, daily_path, daily_drive_name)
+        await asyncio.to_thread(upload_file_to_drive, COMBINED_PATH, COMBINED_FILENAME)
 
 
 def on_open():
@@ -237,6 +299,16 @@ async def main():
     if not UPSTOX_ACCESS_TOKEN:
         logger.error("UPSTOX_ACCESS_TOKEN configuration secret is missing!")
         sys.exit(1)
+
+    os.makedirs(BASE_DATA_DIR, exist_ok=True)
+
+    # Resume any existing history from Drive before appending anything new.
+    # Without this, a fresh GitHub Actions runner would locally start both
+    # files empty and the next sync would overwrite Drive's copies too.
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    daily_path = get_daily_path(today_str)
+    await asyncio.to_thread(download_file_from_drive, os.path.basename(daily_path), daily_path)
+    await asyncio.to_thread(download_file_from_drive, COMBINED_FILENAME, COMBINED_PATH)
 
     start_streamer(UPSTOX_ACCESS_TOKEN)
 
