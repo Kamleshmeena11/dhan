@@ -130,7 +130,12 @@ async def seconds_timer_loop():
 async def google_drive_sync_loop():
     while True:
         await asyncio.sleep(10)
-        upload_to_drive()
+        # upload_to_drive() is a blocking synchronous HTTP call. Running it
+        # directly on the event loop freezes seconds_timer_loop for however
+        # long the request takes (~1-3s here), which is exactly what caused
+        # entire 1s bars to go missing right after every sync. to_thread()
+        # runs it on a worker thread so the per-second timer keeps firing.
+        await asyncio.to_thread(upload_to_drive)
 
 
 def on_open():
