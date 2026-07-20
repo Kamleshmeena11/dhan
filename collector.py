@@ -4,6 +4,7 @@ import time
 import logging
 import asyncio
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 # Upstox SDK & Streaming Tools
@@ -23,6 +24,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Timezone ---
+IST = ZoneInfo("Asia/Kolkata")
+
 # --- Configuration & Credentials ---
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
 INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
@@ -36,14 +40,18 @@ GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN")
 tick_store = []
 
 
-def process_ticks_to_1s():
-    """Compiles all raw stream ticks collected over the past second into an OHLCV bar."""
+def process_ticks_to_1s(bar_time: datetime):
+    """Compiles all raw stream ticks collected over the past second into an OHLCV bar.
+
+    bar_time is the exact second boundary this bar belongs to (computed by the
+    timer loop BEFORE any processing happens), not the wall-clock time at the
+    moment this function actually runs. That's what removes the ~1s lag.
+    """
     global tick_store
     if not tick_store:
         return
 
-    now = datetime.now()
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp_str = bar_time.strftime("%Y-%m-%d %H:%M:%S")
 
     prices = [t["price"] for t in tick_store]
     volumes = [t.get("volume", 0) for t in tick_store]
@@ -65,7 +73,7 @@ def process_ticks_to_1s():
     df = pd.DataFrame([new_row])
     file_exists = os.path.isfile(CSV_FILENAME)
     df.to_csv(CSV_FILENAME, mode="a", index=False, header=not file_exists)
-    logger.info(f"Saved 1s Bar -> {timestamp_str} | Close: {new_row['close']}")
+    logger.info(f"Saved 1s Bar -> {timestamp_str} IST | Close: {new_row['close']}")
 
 
 def upload_to_drive():
@@ -97,12 +105,22 @@ def upload_to_drive():
 
 
 async def seconds_timer_loop():
-    """Triggers the OHLC computation loop precisely at the turn of every clock second."""
+    """Triggers the OHLC computation loop precisely at the turn of every clock second.
+
+    Key fix: the boundary time is computed HERE, right before sleeping to it,
+    and handed to process_ticks_to_1s(). The old code called datetime.now()
+    a second time *inside* process_ticks_to_1s(), after the sleep + any event
+    loop scheduling jitter had already elapsed -- which is exactly what made
+    every printed bar look ~1s (or more, under load) behind the real tick.
+    """
     while True:
         now = time.time()
         sleep_time = 1.0 - (now % 1.0)
+        boundary_epoch = now + sleep_time  # the exact second boundary we're waiting for
         await asyncio.sleep(sleep_time)
-        process_ticks_to_1s()
+
+        bar_time = datetime.fromtimestamp(boundary_epoch, tz=IST)
+        process_ticks_to_1s(bar_time)
 
 
 async def google_drive_sync_loop():
@@ -181,7 +199,7 @@ async def main():
 
     start_streamer(UPSTOX_ACCESS_TOKEN)
 
-    logger.info("Starting up active 1s real-time loops...")
+    logger.info("Starting up active 1s real-time loops (timestamps in IST)...")
     await asyncio.gather(
         seconds_timer_loop(),
         google_drive_sync_loop(),
