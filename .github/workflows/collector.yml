@@ -5,11 +5,23 @@ on:
   repository_dispatch:
     types: [trigger-workflow]
 
+# Prevents a duplicate/retried dispatch from the external cron service from
+# starting a second collector while one is already running — two instances
+# writing/uploading the same CSV concurrently is what caused the earlier
+# Google Drive sync corruption. New dispatches queue instead of overlapping.
+concurrency:
+  group: nifty-1s-collector
+  cancel-in-progress: false
+
 jobs:
   collect:
     name: Collect Market Data
     runs-on: ubuntu-latest
-    timeout-minutes: 375
+    # Market is 09:15-15:30 IST (375 min). Give real buffer above that so
+    # the job timeout is a backstop AFTER the script's own market-close
+    # watchdog fires (login/setup time eats into 375 if set that tight,
+    # and GH would hard-kill mid-flush with no final upload).
+    timeout-minutes: 400
     steps:
       - name: ⬇️ Checkout
         uses: actions/checkout@v4
@@ -41,6 +53,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nifty-bars-${{ github.run_id }}
+          # Adjust this glob to match whatever your script actually names
+          # its outputs (e.g. candles_upstox.csv for the combined file,
+          # candles_upstox_YYYY-MM-DD.csv for the daily one).
           path: |
-            candles_upstox.csv
+            candles_upstox*.csv
+          if-no-files-found: warn
           retention-days: 30
