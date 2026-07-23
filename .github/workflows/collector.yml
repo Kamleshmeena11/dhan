@@ -1,25 +1,55 @@
 name: 📈 Nifty 1s Bar Collector
+
 on:
   workflow_dispatch:
+    inputs:
+      session_end:
+        description: "IST time (HH:MM) this session should stop at"
+        required: false
+        default: "15:30"
   repository_dispatch:
     types: [trigger-workflow]
+    # Your external cron service should fire this twice a day, e.g.:
+    #   09:10 IST -> client_payload: { "session_end": "12:20" }   (session A)
+    #   12:15 IST -> client_payload: { "session_end": "15:30" }   (session B)
+    # Each session then stays comfortably under GitHub's 360-min hard cap
+    # on hosted runners, which timeout-minutes cannot override.
+
+# Prevents an overlapping/duplicate dispatch from starting a second
+# collector while one is already running -- two instances writing/
+# uploading the same CSV concurrently is what caused the earlier
+# Google Drive sync corruption. New dispatches queue instead of overlapping.
+concurrency:
+  group: nifty-1s-collector
+  cancel-in-progress: false
+
 jobs:
   collect:
     name: Collect Market Data
     runs-on: ubuntu-latest
-    timeout-minutes: 375
+    # NOTE: GitHub-hosted runners hard-cap job execution at 360 minutes
+    # (6 hours) regardless of this value -- it CANNOT be raised past that
+    # on a hosted runner. This is why the collector previously got killed
+    # at 15:10 instead of reaching 15:30: the full market day (375 min)
+    # doesn't fit in one job. Each session below (A: ~09:10-12:20,
+    # B: ~12:15-15:30) is under 200 minutes, so 350 here is just a safety
+    # margin, not something actually being relied on for the full day.
+    timeout-minutes: 350
     steps:
       - name: ⬇️ Checkout
         uses: actions/checkout@v4
+
       - name: 🐍 Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
       - name: 📦 Install dependencies
         run: |
           pip install -r requirements.txt
           pip install upstox-python-sdk pyotp requests pandas
+
       - name: 🚀 Run collector
         env:
           UPSTOX_CLIENT_ID: ${{ secrets.UPSTOX_CLIENT_ID }}
@@ -29,13 +59,18 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          SESSION_END_IST: ${{ github.event.inputs.session_end || github.event.client_payload.session_end || '15:30' }}
         run: python collector.py
+
       - name: 📁 Upload daily + combined CSVs as artifact (backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nifty-bars-${{ github.run_id }}
+          # Adjust this glob to match whatever your script actually names
+          # its outputs (e.g. candles_upstox.csv for the combined file,
+          # candles_upstox_YYYY-MM-DD.csv for the daily one).
           path: |
-            candles_upstox.csv
+            candles_upstox*.csv
+          if-no-files-found: warn
           retention-days: 30
- 
