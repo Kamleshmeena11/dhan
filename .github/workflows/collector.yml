@@ -1,76 +1,75 @@
-name: 📈 Nifty 1s Bar Collector
+# Save this file as: .github/workflows/upstox_chart_download.yml in your repo
+#
+# Runs TWO jobs per trading day because NSE hours (9:15-15:30 IST = 6h15m)
+# exceed GitHub-hosted runners' 6-hour-per-job cap. Each job logs in fresh,
+# polls every 5 seconds, and appends to the same repo-committed master CSV.
+
+name: Upstox 1s Chart CSV Polling
 
 on:
+  schedule:
+    - cron: '40 3 * * 1-5'   # 09:10 IST -> morning session start
+    - cron: '50 6 * * 1-5'   # 12:20 IST -> afternoon session start
   workflow_dispatch:
     inputs:
-      session_end:
-        description: "IST time (HH:MM) this session should stop at"
+      session_end_ist:
+        description: 'HH:MM (IST) to stop polling for a manual run'
         required: false
-        default: "15:30"
-  repository_dispatch:
-    types: [trigger-workflow]
-    # Your external cron service should fire this twice a day, e.g.:
-    #   09:10 IST -> client_payload: { "session_end": "12:20" }   (session A)
-    #   12:15 IST -> client_payload: { "session_end": "15:30" }   (session B)
-    # Each session then stays comfortably under GitHub's 360-min hard cap
-    # on hosted runners, which timeout-minutes cannot override.
-
-# Prevents an overlapping/duplicate dispatch from starting a second
-# collector while one is already running -- two instances writing/
-# uploading the same CSV concurrently is what caused the earlier
-# Google Drive sync corruption. New dispatches queue instead of overlapping.
-concurrency:
-  group: nifty-1s-collector
-  cancel-in-progress: false
+        default: '15:35'
 
 jobs:
-  collect:
-    name: Collect Market Data
+  poll:
     runs-on: ubuntu-latest
-    # NOTE: GitHub-hosted runners hard-cap job execution at 360 minutes
-    # (6 hours) regardless of this value -- it CANNOT be raised past that
-    # on a hosted runner. This is why the collector previously got killed
-    # at 15:10 instead of reaching 15:30: the full market day (375 min)
-    # doesn't fit in one job. Each session below (A: ~09:10-12:20,
-    # B: ~12:15-15:30) is under 200 minutes, so 350 here is just a safety
-    # margin, not something actually being relied on for the full day.
-    timeout-minutes: 350
+    timeout-minutes: 200   # ~3h20m, comfortably under the 360-min hard cap
     steps:
-      - name: ⬇️ Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: '3.11'
 
-      - name: 📦 Install dependencies
+      - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install upstox-python-sdk pyotp requests pandas
+          pip install playwright pyotp
+          playwright install --with-deps chromium
 
-      - name: 🚀 Run collector
+      - name: Determine session end time
+        id: session
+        run: |
+          # Morning cron (03:40 UTC) -> stop at 12:25 IST
+          # Afternoon cron (06:50 UTC) -> stop at 15:35 IST
+          # Manual dispatch -> use the provided input
+          HOUR_UTC=$(date -u +%H)
+          if [ -n "${{ github.event.inputs.session_end_ist }}" ]; then
+            END="${{ github.event.inputs.session_end_ist }}"
+          elif [ "$HOUR_UTC" -lt 5 ]; then
+            END="12:25"
+          else
+            END="15:35"
+          fi
+          echo "end=$END" >> "$GITHUB_OUTPUT"
+
+      - name: Run poller
         env:
-          UPSTOX_CLIENT_ID: ${{ secrets.UPSTOX_CLIENT_ID }}
+          UPSTOX_USERNAME: ${{ secrets.UPSTOX_USERNAME }}
+          UPSTOX_PASSWORD: ${{ secrets.UPSTOX_PASSWORD }}
           UPSTOX_TOTP_SECRET: ${{ secrets.UPSTOX_TOTP_SECRET }}
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          SESSION_END_IST: ${{ github.event.inputs.session_end || github.event.client_payload.session_end || '15:30' }}
-        run: python collector.py
+          SESSION_END_IST: ${{ steps.session.outputs.end }}
+        run: python download_chart_csv.py
 
-      - name: 📁 Upload daily + combined CSVs as artifact (backup)
+      - name: Commit updated master CSVs back to repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/*.csv
+          git commit -m "1s chart data update $(date -u +%F' '%H:%M)Z" || echo "nothing to commit"
+          git pull --rebase
+          git push
+
+      - name: Upload as workflow artifact too
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nifty-bars-${{ github.run_id }}
-          # Adjust this glob to match whatever your script actually names
-          # its outputs (e.g. candles_upstox.csv for the combined file,
-          # candles_upstox_YYYY-MM-DD.csv for the daily one).
-          path: |
-            candles_upstox*.csv
-          if-no-files-found: warn
-          retention-days: 30
+          name: upstox-1s-csv-${{ github.run_id }}
+          path: data/*.csv
+          retention-days: 90
