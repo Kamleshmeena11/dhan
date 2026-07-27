@@ -1,0 +1,66 @@
+# Save this file as: .github/workflows/upstox_chart_download.yml
+#
+# Uses repository_dispatch (fired by an external cron service, e.g.
+# cron-job.org) instead of GitHub's own `schedule:` trigger, since that's
+# already been found unreliable for your WebSocket collector. Fire this
+# twice a day from your external cron:
+#   09:10 IST -> client_payload: { "session_end": "12:20" }   (session A)
+#   12:15 IST -> client_payload: { "session_end": "15:35" }   (session B)
+
+name: 📊 Upstox 1s Chart CSV Download
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_end:
+        description: "IST time (HH:MM) this session should stop at"
+        required: false
+        default: "15:35"
+  repository_dispatch:
+    types: [trigger-chart-download]
+
+# Prevents overlapping runs (e.g. a retried dispatch) from both writing to
+# the same daily CSV / racing on Drive sync at once.
+concurrency:
+  group: upstox-chart-download
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    name: Poll Chart & Download
+    runs-on: ubuntu-latest
+    # GitHub-hosted runners hard-cap job execution at 360 minutes regardless
+    # of this value. Each session (~3h15m) is well under that.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright pyotp google-api-python-client google-auth
+          playwright install --with-deps chromium
+
+      - name: Run poller
+        env:
+          UPSTOX_USERNAME: ${{ secrets.UPSTOX_USERNAME }}
+          UPSTOX_PASSWORD: ${{ secrets.UPSTOX_PASSWORD }}
+          UPSTOX_TOTP_SECRET: ${{ secrets.UPSTOX_TOTP_SECRET }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          SESSION_END_IST: ${{ github.event.inputs.session_end || github.event.client_payload.session_end || '15:35' }}
+        run: python download_chart_csv_v2.py
+
+      - name: Upload CSVs as workflow artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstox-chart-csv-${{ github.run_id }}
+          path: data/**/*.csv
+          if-no-files-found: warn
+          retention-days: 90
