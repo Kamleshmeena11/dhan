@@ -63,11 +63,8 @@ fut_tick_buffer = []                 # rows waiting to be written (filled by fee
 fut_buffer_lock = threading.Lock()
 fut_last_signature = None            # (ltt, vtt, ltp) of the last tick recorded, to skip repeat snapshots
 
-FUT_TICK_COLUMNS = [
-    "timestamp", "ltt_ms", "recv_time", "instrument_key", "trading_symbol",
-    "ltp", "ltq", "cp", "vtt", "atp", "oi", "tbq", "tsq",
-    "bid_price", "bid_qty", "ask_price", "ask_qty",
-]
+fut_last_bid = None                  # last known best bid/ask, reused if a tick arrives without depth
+fut_last_ask = None
 
 BASE_DATA_DIR = "data"
 DAILY_DIR = os.path.join(BASE_DATA_DIR, "daily")
@@ -82,8 +79,9 @@ def get_validation_log_path(label: str, date_str: str) -> str:
 
 
 def get_fut_tick_path(date_str: str) -> str:
-    """e.g. data/daily/2026-07-20/bank_nifty_fut_ticks_2026-07-20.csv"""
-    return os.path.join(DAILY_DIR, date_str, f"{FUT_LABEL}_ticks_{date_str}.csv")
+    """e.g. data/daily/2026-07-20/bank_nifty_fut_ticks_2026-07-20.txt
+    Semicolon-delimited, no header: Timestamp;Price;Bid;Ask;Volume"""
+    return os.path.join(DAILY_DIR, date_str, f"{FUT_LABEL}_ticks_{date_str}.txt")
 
 
 def get_combined_filename(label: str) -> str:
@@ -157,10 +155,18 @@ def _to_float(v):
         return None
 
 
+def _fmt_num(v):
+    """55409.0 -> '55409', 55409.80 -> '55409.8' (no trailing zeros)."""
+    if v is None:
+        return ""
+    return (f"{v:.4f}".rstrip("0").rstrip(".")) or "0"
+
+
 def record_fut_tick(feed: dict):
-    """Called from the feed thread. Extracts one raw tick from a futures feed
-    message and queues it. Disk I/O happens elsewhere, never in this callback."""
-    global fut_last_signature
+    """Called from the feed thread. Builds one line in the format
+        yyyyMMdd HHmmss fffffff;Price;Bid;Ask;Volume
+    and queues it. Disk I/O happens elsewhere, never in this callback."""
+    global fut_last_signature, fut_last_bid, fut_last_ask
 
     market_ff = feed.get("fullFeed", {}).get("marketFF", {})
     ltpc = market_ff.get("ltpc") or feed.get("ltpc")
@@ -180,64 +186,52 @@ def record_fut_tick(feed: dict):
 
     try:
         ltt_ms = int(ltt)
-        ts_str = datetime.fromtimestamp(ltt_ms / 1000, tz=IST).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     except (TypeError, ValueError):
-        ltt_ms = None
-        ts_str = None
+        ltt_ms = int(time.time() * 1000)
+
+    dt = datetime.fromtimestamp(ltt_ms // 1000, tz=IST)
+    # Upstox gives millisecond precision; the 7-digit field is ms padded with 4 zeros.
+    timestamp = dt.strftime("%Y%m%d %H%M%S") + f" {ltt_ms % 1000:03d}0000"
 
     quotes = (market_ff.get("marketLevel", {}) or {}).get("bidAskQuote") or []
     best = quotes[0] if quotes else {}
+    bid = _to_float(best.get("bidP"))
+    ask = _to_float(best.get("askP"))
+    if not bid:
+        bid = fut_last_bid
+    if not ask:
+        ask = fut_last_ask
+    fut_last_bid, fut_last_ask = bid, ask
 
-    row = {
-        "timestamp": ts_str,
-        "ltt_ms": ltt_ms,
-        "recv_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-        "instrument_key": fut_instrument_key,
-        "trading_symbol": fut_trading_symbol,
-        "ltp": ltp,
-        "ltq": _to_float(ltpc.get("ltq")),
-        "cp": _to_float(ltpc.get("cp")),
-        "vtt": vtt,
-        "atp": _to_float(market_ff.get("atp")),
-        "oi": _to_float(market_ff.get("oi")),
-        "tbq": _to_float(market_ff.get("tbq")),
-        "tsq": _to_float(market_ff.get("tsq")),
-        "bid_price": _to_float(best.get("bidP")),
-        "bid_qty": _to_float(best.get("bidQ")),
-        "ask_price": _to_float(best.get("askP")),
-        "ask_qty": _to_float(best.get("askQ")),
-    }
+    volume = _to_float(ltpc.get("ltq")) or 0
+
+    line = f"{timestamp};{_fmt_num(ltp)};{_fmt_num(bid)};{_fmt_num(ask)};{_fmt_num(volume)}"
     with fut_buffer_lock:
-        fut_tick_buffer.append(row)
+        fut_tick_buffer.append((dt.strftime("%Y-%m-%d"), line))
 
 
 def flush_fut_ticks():
-    """Drains the queued futures ticks and appends them to the right day's CSV."""
+    """Drains the queued futures ticks and appends them to the right day's file."""
     with fut_buffer_lock:
         if not fut_tick_buffer:
             return
-        rows = fut_tick_buffer[:]
+        items = fut_tick_buffer[:]
         fut_tick_buffer.clear()
 
     by_date = {}
-    for r in rows:
-        date_str = (r["timestamp"] or r["recv_time"]).split(" ")[0]
-        by_date.setdefault(date_str, []).append(r)
+    for date_str, line in items:
+        by_date.setdefault(date_str, []).append(line)
 
-    for date_str, day_rows in by_date.items():
+    for date_str, lines in by_date.items():
         path = get_fut_tick_path(date_str)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            file_exists = os.path.isfile(path)
             with open(path, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=FUT_TICK_COLUMNS)
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerows(day_rows)
+                f.write("\n".join(lines) + "\n")
         except Exception as e:
-            logger.error(f"Failed writing futures ticks to {path}: {e} -- requeueing {len(day_rows)} rows")
+            logger.error(f"Failed writing futures ticks to {path}: {e} -- requeueing {len(lines)} rows")
             with fut_buffer_lock:
-                fut_tick_buffer[:0] = day_rows
+                fut_tick_buffer[:0] = [(date_str, l) for l in lines]
 
 
 async def fut_tick_flush_loop():
